@@ -1,0 +1,82 @@
+name: red-barrial
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:${KEYCLOAK_VERSION:-26.0}
+    # start-dev usa H2 en archivo: válido para entorno local, no para producción.
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?definir KEYCLOAK_ADMIN_PASSWORD en .env}
+      # Nombre del host público sin esquema. Keycloak espera el hostname, no la URL completa.
+      KC_HOSTNAME: ${PUBLIC_HOST:-localhost}
+      KC_HTTP_PORT: "8080"
+      KC_HEALTH_ENABLED: "true"
+      # La app configura explícitamente sus endpoints internos OIDC.
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "false"
+      JAVA_OPTS_KC_HEAP: -Xms256m -Xmx768m
+      # Variables usadas como ${...} dentro del realm importado.
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?definir OIDC_CLIENT_SECRET en .env}
+      OIDC_RP_CLIENT_SECRET: ${OIDC_RP_CLIENT_SECRET:?definir OIDC_RP_CLIENT_SECRET en .env}
+      APP_PUBLIC_URL: http://${PUBLIC_HOST:-localhost}:8000
+    ports:
+      - "8080:8080"
+    volumes:
+      - keycloak-data:/opt/keycloak/data/h2
+      - ./keycloak/realm:/opt/keycloak/data/import:ro
+    healthcheck:
+      test: ["CMD", "/opt/keycloak/bin/kcadm.sh", "config", "credentials", "--server", "http://localhost:8080", "--realm", "master", "--user", "admin", "--password", "admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  padron-mock:
+    build: ./padron-mock
+    environment:
+      MOCK_LATENCY_MIN: ${MOCK_LATENCY_MIN:-0.2}
+      MOCK_LATENCY_MAX: ${MOCK_LATENCY_MAX:-7.0}
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0.2}
+    ports:
+      - "127.0.0.1:8001:8001"   # solo local: Swagger UI en /docs, Redoc en /redoc
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?definir DJANGO_SECRET_KEY en .env}
+      DJANGO_DEBUG: "0"
+      DJANGO_ALLOWED_HOSTS: ${PUBLIC_HOST:-localhost},localhost
+      DATABASE_PATH: /data/db.sqlite3
+      # OIDC: el navegador usa la URL pública; el contenedor usa la interna.
+      OIDC_RP_CLIENT_ID: red-barrial-web
+      OIDC_RP_CLIENT_SECRET: ${OIDC_RP_CLIENT_SECRET:?definir OIDC_RP_CLIENT_SECRET en .env}
+      OIDC_OP_AUTHORIZATION_ENDPOINT: http://${PUBLIC_HOST:-localhost}:8080/realms/red-barrial/protocol/openid-connect/auth
+      OIDC_OP_LOGOUT_ENDPOINT: http://${PUBLIC_HOST:-localhost}:8080/realms/red-barrial/protocol/openid-connect/logout
+      OIDC_OP_TOKEN_ENDPOINT: http://keycloak:8080/realms/red-barrial/protocol/openid-connect/token
+      OIDC_OP_USER_ENDPOINT: http://keycloak:8080/realms/red-barrial/protocol/openid-connect/userinfo
+      OIDC_OP_JWKS_ENDPOINT: http://keycloak:8080/realms/red-barrial/protocol/openid-connect/certs
+      # Padrón provincial (simulado).
+      PADRON_URL: http://padron-mock:8001
+      PADRON_TIMEOUT_SECONDS: "5"
+      PADRON_CACHE_MAX_AGE_HOURS: "168"
+    ports:
+      - "8000:8000"
+    volumes:
+      - app-data:/data
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      padron-mock:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  app-data:
+  keycloak-data:
